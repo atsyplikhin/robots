@@ -441,6 +441,38 @@ class TestReachyMiniDriver(unittest.TestCase):
         self.assertEqual(identity.manufacturer, "Pollen Robotics")
         self.assertIn("192.168.1.50", identity.model)
 
+    def test_transport_mode_is_accepted(self):
+        driver = self.ReachyMiniDriver(transport_mode="websocket")
+        self.assertEqual(driver._transport_mode, "websocket")
+
+    def test_invalid_transport_mode_raises(self):
+        with self.assertRaises(ValueError):
+            self.ReachyMiniDriver(transport_mode="serial")
+
+    def test_connect_forces_websocket_mode(self):
+        driver = self.ReachyMiniDriver(host="192.168.1.50", transport_mode="websocket")
+        with patch("strands_robots.device_connect.reachy_mini_driver.WebSocketLink") as ws_cls:
+            ws_link = AsyncMock()
+            ws_cls.return_value = ws_link
+            with patch("strands_robots.device_connect.reachy_mini_driver.ZenohLink") as zenoh_cls:
+                asyncio.run(driver.connect())
+        ws_cls.assert_called_once_with("192.168.1.50", 8000)
+        zenoh_cls.assert_not_called()
+        ws_link.start.assert_awaited_once()
+
+    def test_connect_forces_zenoh_mode(self):
+        driver = self.ReachyMiniDriver(transport_mode="zenoh")
+        mock_transport = AsyncMock()
+        driver._transport = mock_transport
+        with patch("strands_robots.device_connect.reachy_mini_driver.ZenohLink") as zenoh_cls:
+            zenoh_link = AsyncMock()
+            zenoh_cls.return_value = zenoh_link
+            with patch("strands_robots.device_connect.reachy_mini_driver.WebSocketLink") as ws_cls:
+                asyncio.run(driver.connect())
+        zenoh_cls.assert_called_once_with(mock_transport, "reachy_mini")
+        ws_cls.assert_not_called()
+        zenoh_link.start.assert_awaited_once()
+
     def test_look_rpc(self):
         driver = self._make_driver()
         result = asyncio.run(

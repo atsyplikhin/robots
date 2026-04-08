@@ -1,6 +1,6 @@
-# Reachy Mini — Cloud Zenoh Mesh Guide
+# Reachy Mini — Device Connect Guide
 
-Connect a Reachy Mini Lite (USB) to the AWS-hosted Zenoh mesh via Device Connect so any agent on the mesh can discover and control it.
+Connect a Reachy Mini Lite over USB, register it to a NATS-backed Device Connect tenant, and control it from a keyboard-driven controller device.
 
 ## Prerequisites
 
@@ -35,17 +35,28 @@ source .venv/bin/activate
 uv pip install websockets  # required dependency not yet in setup
 ```
 
-## 3. Connect to the Cloud Zenoh Mesh
+## 3. Register the Reachy Mini to NATS
 
-Set environment variables (every terminal that talks to the mesh):
+On the Reachy device, activate the repo environment and set the NATS + device credential variables:
 
 ```bash
-export ZENOH_CONNECT=tcp/zenoh-nlb-2cb0b84309701828.elb.us-east-1.amazonaws.com:7447
-export ZENOH_MODE=client
+cd /path/to/robots
+source .venv/bin/activate
+
+export MESSAGING_BACKEND=nats
+export NATS_URL='nats://<nats-host>:4222'
+export MESSAGING_URLS="$NATS_URL"
+export TENANT='<tenant>'
+export DEVICE_ID='<reachy-device-id>'
+export NATS_CREDENTIALS_FILE='/path/to/<reachy-device-id>.creds.json'
 export DEVICE_CONNECT_ALLOW_INSECURE=true
+
+export REACHY_HOST='127.0.0.1'
+export REACHY_PORT='8000'
+export REACHY_TRANSPORT_MODE='websocket'
 ```
 
-Start the Device Connect runtime (bridges the local daemon to the cloud mesh):
+Start the Device Connect runtime:
 
 ```bash
 python -c "
@@ -53,11 +64,18 @@ import asyncio, os
 from strands_robots.device_connect import ReachyMiniDriver
 from device_connect_sdk import DeviceRuntime
 
-driver = ReachyMiniDriver(host='localhost', api_port=9002)
+driver = ReachyMiniDriver(
+    host=os.environ['REACHY_HOST'],
+    api_port=int(os.environ['REACHY_PORT']),
+    transport_mode=os.environ['REACHY_TRANSPORT_MODE'],
+)
 runtime = DeviceRuntime(
     driver=driver,
-    device_id='reachy-mini-1',
-    messaging_urls=[os.environ['ZENOH_CONNECT']],
+    device_id=os.environ['DEVICE_ID'],
+    tenant=os.environ['TENANT'],
+    messaging_urls=[os.environ['NATS_URL']],
+    messaging_backend='nats',
+    nats_credentials_file=os.environ['NATS_CREDENTIALS_FILE'],
     allow_insecure=True,
 )
 asyncio.run(runtime.run())
@@ -67,67 +85,53 @@ asyncio.run(runtime.run())
 Expected output:
 
 ```
-INFO - Using ZENOH messaging backend
-INFO - Connected to ZENOH broker: ['tcp/zenoh-nlb-...amazonaws.com:7447']
+INFO - Using NATS messaging backend
+INFO - Connected to NATS broker: ['nats://<nats-host>:4222']
 INFO - Driver connected: reachy_mini
 INFO - Device registered: registration_id=...
-INFO - Subscribed to commands on device-connect.default.reachy-mini-1.cmd
+INFO - Subscribed to commands on device-connect.<tenant>.<reachy-device-id>.cmd
 ```
 
-Leave this running. The robot is now on the mesh as `reachy-mini-1`.
+Leave this running. The Reachy is now registered as `<reachy-device-id>`.
 
-## 4. Invoke Commands from Any Mesh Client
+## 4. Run the Keyboard Controller Device
 
-From another terminal (with the same env vars and venv activated):
+On the Jetson controller machine, use a separate controller credential:
 
 ```bash
-source robots/.venv/bin/activate
-export ZENOH_CONNECT=tcp/zenoh-nlb-2cb0b84309701828.elb.us-east-1.amazonaws.com:7447
-export ZENOH_MODE=client
+cd /path/to/robots
+source .venv/bin/activate
+
+export NATS_URL='nats://<nats-host>:4222'
+export NATS_CREDENTIALS_FILE='/path/to/<controller-device-id>.creds.json'
 export DEVICE_CONNECT_ALLOW_INSECURE=true
+
+python strands_robots/device_connect/reachy_keyboard_controller.py \
+  --device-id <controller-device-id> \
+  --tenant <tenant> \
+  --target-device-id <reachy-device-id>
 ```
 
-### Move antennas
+This controller registers as its own device and uses `invoke_remote(...)` to call the Reachy RPCs.
 
-```python
-from device_connect_agent_tools import connect, invoke_device
-connect()
-r = invoke_device('reachy-mini-1', 'antennas', {'left': 30, 'right': -30})
-print('RESULT:', r)
-# {'success': True, 'result': {'status': 'success', 'left': 30, 'right': -30}}
+### Keyboard controls
+
+```text
+w / s              look up / down
+a / d              yaw left / right
+z / x              roll left / right
+j / l              move antennas
+0                  reset antennas
+c                  center head pose + antennas
+nod                yes gesture
+shake              no gesture
+happy              antenna wiggle
+look P Y [R]       absolute head pose
+antennas L R       absolute antenna angles
+quit               exit controller
 ```
 
-### Look (head pose)
-
-```python
-invoke_device('reachy-mini-1', 'look', {'pitch': -15, 'yaw': 15, 'roll': 0})
-# pitch: up/down (negative = look up), yaw: left/right, roll: tilt
-```
-
-### Expressions
-
-```python
-invoke_device('reachy-mini-1', 'nod')    # yes gesture
-invoke_device('reachy-mini-1', 'shake')  # no gesture
-invoke_device('reachy-mini-1', 'happy')  # antenna wiggle
-```
-
-### Sequence example
-
-```python
-from device_connect_agent_tools import connect, invoke_device
-import time
-
-connect()
-invoke_device('reachy-mini-1', 'look', {'pitch': -10, 'yaw': 15})
-time.sleep(1)
-invoke_device('reachy-mini-1', 'nod')
-time.sleep(2)
-invoke_device('reachy-mini-1', 'look', {'pitch': 0, 'yaw': 0, 'roll': 0})
-print('Done!')
-```
-
-## Available RPCs
+## Reachy RPCs
 
 | RPC | Parameters | Description |
 |-----|-----------|-------------|
@@ -155,12 +159,14 @@ You need **three terminals**:
 | Terminal | Command | Purpose |
 |----------|---------|---------|
 | 1 | `python start_reachy_daemon.py` | USB serial daemon (port 9002) |
-| 2 | Device Connect runtime script (step 3) | Bridges daemon to cloud Zenoh mesh |
-| 3 | `invoke_device(...)` calls (step 4) | Send commands to the robot |
+| 2 | Reachy runtime (step 3) | Registers the Reachy device to NATS |
+| 3 | Keyboard controller (step 4) | Sends `look` / `antennas` / expression commands |
 
 ## Troubleshooting
 
 - **`No USB serial device found`** — Check that Reachy is plugged in (`ls /dev/cu.usbmodem*`)
 - **`ModuleNotFoundError: websockets`** — Run `uv pip install websockets`
-- **`KeyboardInterrupt` on import** — The `cv2` import can hang; make sure the daemon terminal is separate from the Device Connect terminal
+- **`ModuleNotFoundError: device_connect_edge`** — Install a recent Device Connect build that includes `device_connect_edge`
+- **`nats: no responders available for request`** — The Reachy runtime is not running, or `--target-device-id` does not match the registered Reachy device ID
+- **`nats: permissions violation`** — The `tenant`, `device_id`, or NATS credential file does not match the commissioned device
 - **Connection refused on port 9002** — Daemon not running; start it first (step 1)

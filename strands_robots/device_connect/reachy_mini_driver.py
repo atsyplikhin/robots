@@ -41,11 +41,18 @@ class ReachyMiniDriver(DeviceDriver):
         host: str = "reachy-mini.local",
         prefix: str = "reachy_mini",
         api_port: int = 8000,
+        transport_mode: str = "auto",
     ):
         super().__init__()
+        mode = transport_mode.lower()
+        if mode not in {"auto", "zenoh", "wireless", "websocket", "lite"}:
+            raise ValueError(
+                "transport_mode must be one of: auto, zenoh, wireless, websocket, lite"
+            )
         self._host = host
         self._prefix = prefix
         self._api_port = api_port
+        self._transport_mode = mode
         self._latest_joints: Optional[dict] = None
         self._latest_imu: Optional[dict] = None
         self._hw = None
@@ -65,13 +72,18 @@ class ReachyMiniDriver(DeviceDriver):
 
     async def connect(self) -> None:
         """Connect to the Reachy Mini, auto-detecting Wireless vs Lite."""
-        try:
-            status = await asyncio.to_thread(
-                api, self._host, self._api_port, "/api/daemon/status"
-            )
-            is_lite = not status.get("wireless_version", True)
-        except Exception:
+        if self._transport_mode in {"websocket", "lite"}:
+            is_lite = True
+        elif self._transport_mode in {"zenoh", "wireless"}:
             is_lite = False
+        else:
+            try:
+                status = await asyncio.to_thread(
+                    api, self._host, self._api_port, "/api/daemon/status"
+                )
+                is_lite = not status.get("wireless_version", True)
+            except Exception:
+                is_lite = False
 
         if is_lite:
             self._hw = WebSocketLink(self._host, self._api_port)
@@ -96,6 +108,21 @@ class ReachyMiniDriver(DeviceDriver):
         """Send a real-time command via the active hardware link."""
         await self._hw.send_cmd(cmd)
 
+    @emit()
+    async def headPoseChanged(self, pitch: float, yaw: float, roll: float):
+        """Emitted when the head pose command is applied."""
+        pass
+
+    @emit()
+    async def antennasChanged(self, left: float, right: float):
+        """Emitted when the antenna angles change."""
+        pass
+
+    @emit()
+    async def expressionTriggered(self, name: str):
+        """Emitted when an expression RPC is triggered."""
+        pass
+
     # ── Movement RPCs (Zenoh via transport) ────────────────────
 
     @rpc()
@@ -119,6 +146,7 @@ class ReachyMiniDriver(DeviceDriver):
             z: Z offset in mm
         """
         await self._send_cmd({"head_pose": rpy_to_pose(pitch, roll, yaw, x, y, z)})
+        await self.headPoseChanged(pitch=pitch, yaw=yaw, roll=roll)
         return {"status": "success", "pitch": pitch, "roll": roll, "yaw": yaw}
 
     @rpc()
@@ -132,6 +160,7 @@ class ReachyMiniDriver(DeviceDriver):
         await self._send_cmd(
             {"antennas_joint_positions": [math.radians(left), math.radians(right)]}
         )
+        await self.antennasChanged(left=left, right=right)
         return {"status": "success", "left": left, "right": right}
 
     @rpc()
@@ -240,6 +269,7 @@ class ReachyMiniDriver(DeviceDriver):
             await self._send_cmd({"head_pose": rpy_to_pose(-10, 0, 0)})
             await asyncio.sleep(0.25)
         await self._send_cmd({"head_pose": identity_pose()})
+        await self.expressionTriggered(name="nod")
         return {"status": "success", "expression": "nod"}
 
     @rpc()
@@ -251,6 +281,7 @@ class ReachyMiniDriver(DeviceDriver):
             await self._send_cmd({"head_pose": rpy_to_pose(0, 0, -25)})
             await asyncio.sleep(0.2)
         await self._send_cmd({"head_pose": identity_pose()})
+        await self.expressionTriggered(name="shake")
         return {"status": "success", "expression": "shake"}
 
     @rpc()
@@ -266,6 +297,7 @@ class ReachyMiniDriver(DeviceDriver):
             )
             await asyncio.sleep(0.2)
         await self._send_cmd({"antennas_joint_positions": [0, 0]})
+        await self.expressionTriggered(name="happy")
         return {"status": "success", "expression": "happy"}
 
     # ── Lifecycle RPCs (REST) ─────────────────────────────────
