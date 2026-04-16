@@ -3,10 +3,13 @@
 
 Mic -> speech-to-text -> optional direct Reachy control.
 
-This script is intentionally not a Device Connect device. It is a local process
-that captures audio from ALSA with ``arecord``, transcribes it with Vosk, logs
-the recognized text, and can optionally send parsed commands directly to a
-remote Reachy Mini over Device Connect agent tools.
+By default this script is just a local process: it captures audio from ALSA,
+transcribes it with Vosk, logs the recognized text, and optionally sends parsed
+commands directly to a remote Reachy Mini over Device Connect agent tools.
+
+When ``--device-id`` and ``--tenant`` are provided, it also starts an embedded
+``ReachyVoiceController`` Device Connect runtime so the Jetson voice process
+appears in discovery while keeping the mic/STT pipeline local.
 """
 
 from __future__ import annotations
@@ -18,8 +21,9 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from strands_robots.device_connect.reachy_voice_core import ReachyVoiceCommandCore
 
@@ -56,6 +60,26 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--target-device-id",
         help="Reachy device ID to control. If omitted, run in transcript log-only mode.",
+    )
+    parser.add_argument(
+        "--device-id",
+        default=os.getenv("DEVICE_ID"),
+        help="Optional controller device ID. If set with --tenant, register this local runner as a Device Connect device.",
+    )
+    parser.add_argument(
+        "--tenant",
+        default=os.getenv("TENANT"),
+        help="Tenant namespace for the optional registered controller mode.",
+    )
+    parser.add_argument(
+        "--nats-url",
+        default=os.getenv("NATS_URL", "nats://localhost:4222"),
+        help="NATS broker URL for the optional registered controller mode.",
+    )
+    parser.add_argument(
+        "--nats-credentials-file",
+        default=os.getenv("NATS_CREDENTIALS_FILE"),
+        help="Credential file for the optional registered controller mode.",
     )
     parser.add_argument(
         "--source-device-id",
@@ -164,16 +188,120 @@ def _build_core(args: argparse.Namespace) -> ReachyVoiceCommandCore:
     )
 
 
+def _build_registered_handler(args: argparse.Namespace) -> tuple[Callable[[str], dict], Callable[[], None]]:
+    if not args.target_device_id:
+        raise ValueError("--target-device-id is required when registering the local voice runner")
+    if not args.device_id or not args.tenant:
+        raise ValueError("--device-id and --tenant are required for registered controller mode")
+
+    from device_connect_sdk import DeviceRuntime
+
+    from strands_robots.device_connect.reachy_voice_controller import ReachyVoiceController
+
+    driver = ReachyVoiceController(
+        target_device_id=args.target_device_id,
+        pitch_step=args.pitch_step,
+        yaw_step=args.yaw_step,
+        roll_step=args.roll_step,
+        antenna_step=args.antenna_step,
+        min_confidence=args.min_confidence,
+    )
+    runtime_kwargs = {
+        "driver": driver,
+        "device_id": args.device_id,
+        "tenant": args.tenant,
+        "messaging_urls": [args.nats_url],
+        "messaging_backend": "nats",
+        "allow_insecure": True,
+    }
+    if args.nats_credentials_file:
+        runtime_kwargs["nats_credentials_file"] = args.nats_credentials_file
+
+    runtime = DeviceRuntime(**runtime_kwargs)
+    loop = asyncio.new_event_loop()
+    ready = threading.Event()
+
+    def _run():
+        asyncio.set_event_loop(loop)
+
+        async def _start():
+            runtime._background_task = asyncio.create_task(runtime.run())
+            ready.set()
+
+        loop.run_until_complete(_start())
+        loop.run_forever()
+
+    thread = threading.Thread(target=_run, daemon=True, name="reachy-voice-local-runtime")
+    thread.start()
+    ready.wait(timeout=30.0)
+
+    runtime._loop = loop
+    runtime._thread = thread
+
+    print(
+        f"Registered local voice controller as {args.device_id} on tenant {args.tenant}",
+        flush=True,
+    )
+
+    def _handle(transcript: str) -> dict:
+        future = asyncio.run_coroutine_threadsafe(
+            driver.handleVoiceCommand(
+                transcript=transcript,
+                source_device_id=args.source_device_id,
+            ),
+            loop,
+        )
+        return future.result()
+
+    def _shutdown() -> None:
+        try:
+            future = asyncio.run_coroutine_threadsafe(runtime.stop(), loop)
+            future.result(timeout=10.0)
+        except Exception:
+            pass
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5.0)
+
+    return _handle, _shutdown
+
+
+def _build_local_handler(args: argparse.Namespace) -> tuple[Optional[Callable[[str], dict]], Callable[[], None]]:
+    core = _build_core(args) if args.target_device_id else None
+
+    if core is None:
+        return None, lambda: None
+
+    def _handle(transcript: str) -> dict:
+        return asyncio.run(
+            core.handle_voice_command(
+                transcript=transcript,
+                source_device_id=args.source_device_id,
+            )
+        )
+
+    return _handle, lambda: None
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(argv)
     recognizer = _load_vosk(args.model_path, args.sample_rate)
     arecord = _open_arecord(args.alsa_device, args.sample_rate)
-    core = _build_core(args) if args.target_device_id else None
+    handle_command, shutdown = (
+        _build_registered_handler(args)
+        if args.device_id and args.tenant
+        else _build_local_handler(args)
+    )
 
     last_partial = ""
     print(
         f"Listening on {args.alsa_device} at {args.sample_rate} Hz"
-        + (f" -> target {args.target_device_id}" if args.target_device_id else " (log-only)"),
+        + (
+            f" -> target {args.target_device_id} as device {args.device_id}"
+            if args.target_device_id and args.device_id and args.tenant
+            else f" -> target {args.target_device_id}"
+            if args.target_device_id
+            else " (log-only)"
+        ),
         flush=True,
     )
 
@@ -197,15 +325,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                     continue
 
                 print(f"[final] {text}", flush=True)
-                if core is None:
+                if handle_command is None:
                     continue
 
-                payload = asyncio.run(
-                    core.handle_voice_command(
-                        transcript=text,
-                        source_device_id=args.source_device_id,
-                    )
-                )
+                payload = handle_command(text)
                 if payload["status"] == "success":
                     print(f"[command] {payload['action']} -> {payload['result']}", flush=True)
                 else:
@@ -224,6 +347,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 arecord.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 arecord.kill()
+        shutdown()
 
     return 0
 
