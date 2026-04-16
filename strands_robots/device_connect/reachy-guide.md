@@ -2,6 +2,9 @@
 
 Connect a Reachy Mini Lite over USB, register it to a NATS-backed Device Connect tenant, and control it from a keyboard-driven controller device.
 
+For the Jetson voice-control demo that builds on this branch, see
+[`reachy-voice-demo.md`](./reachy-voice-demo.md).
+
 ## Prerequisites
 
 - Reachy Mini Lite plugged in via USB

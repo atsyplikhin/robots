@@ -1,6 +1,6 @@
 """Unit tests for Device Connect DeviceDriver adapters.
 
-Tests RobotDeviceDriver, SimulationDeviceDriver, ReachyMiniDriver,
+Tests RobotDeviceDriver, SimulationDeviceDriver, ReachyMiniDriver, ReachyVoiceController,
 init_device_connect(), and the updated robot_mesh tool.
 
 All external dependencies (Zenoh, LeRobot, device_connect_sdk, strands) are mocked.
@@ -632,6 +632,159 @@ class TestReachyMiniDriver(unittest.TestCase):
         payload = json.loads(payload_bytes.decode())
         self.assertTrue(payload["torque"])
         self.assertIsNone(payload["ids"])
+
+
+# ── TestReachyVoiceController ────────────────────────────────────
+
+class TestReachyVoiceController(unittest.TestCase):
+
+    def setUp(self):
+        if "strands_robots.device_connect.reachy_voice_controller" in sys.modules:
+            del sys.modules["strands_robots.device_connect.reachy_voice_controller"]
+        from strands_robots.device_connect.reachy_voice_controller import ReachyVoiceController
+        self.ReachyVoiceController = ReachyVoiceController
+
+    def _make_driver(self, **kwargs):
+        driver = self.ReachyVoiceController(target_device_id="reachy-1", **kwargs)
+        driver.invoke_remote = AsyncMock(return_value={"status": "ok"})
+        return driver
+
+    def test_identity(self):
+        driver = self._make_driver(source_device_id="voice-1")
+        identity = driver.identity
+        self.assertEqual(identity.device_type, "reachy_voice_controller")
+        self.assertEqual(identity.manufacturer, "Strands")
+        self.assertEqual(identity.model, "ReachyVoiceController")
+
+    def test_yaw_left_command_invokes_look(self):
+        driver = self._make_driver()
+        result = asyncio.run(driver.handleVoiceCommand("yaw left"))
+        self.assertEqual(result["status"], "success")
+        driver.invoke_remote.assert_awaited_once_with(
+            "reachy-1",
+            "look",
+            pitch=0,
+            yaw=-5,
+            roll=0,
+        )
+
+    def test_word_number_amount_is_supported(self):
+        driver = self._make_driver(yaw_step=5)
+        result = asyncio.run(driver.handleVoiceCommand("yaw right ten"))
+        self.assertEqual(result["action"], "yaw_right")
+        driver.invoke_remote.assert_awaited_once_with(
+            "reachy-1",
+            "look",
+            pitch=0,
+            yaw=10,
+            roll=0,
+        )
+
+    def test_natural_language_amount_phrase_is_supported(self):
+        driver = self._make_driver(yaw_step=5)
+        result = asyncio.run(driver.handleVoiceCommand("yaw left by ten degrees"))
+        self.assertEqual(result["action"], "yaw_left")
+        driver.invoke_remote.assert_awaited_once_with(
+            "reachy-1",
+            "look",
+            pitch=0,
+            yaw=-10,
+            roll=0,
+        )
+
+    def test_look_left_phrase_is_supported(self):
+        driver = self._make_driver(yaw_step=5)
+        result = asyncio.run(driver.handleVoiceCommand("look left"))
+        self.assertEqual(result["action"], "look_left")
+        driver.invoke_remote.assert_awaited_once_with(
+            "reachy-1",
+            "look",
+            pitch=0,
+            yaw=-5,
+            roll=0,
+        )
+
+    def test_observed_vosk_phrase_is_supported(self):
+        driver = self._make_driver(yaw_step=5)
+        result = asyncio.run(driver.handleVoiceCommand("he looked left by seven degrees"))
+        self.assertEqual(result["action"], "look_left")
+        driver.invoke_remote.assert_awaited_once_with(
+            "reachy-1",
+            "look",
+            pitch=0,
+            yaw=-7,
+            roll=0,
+        )
+
+    def test_absolute_look_command(self):
+        driver = self._make_driver()
+        result = asyncio.run(driver.handleVoiceCommand("look 10 20 -30"))
+        self.assertEqual(result["action"], "look_absolute")
+        driver.invoke_remote.assert_awaited_once_with(
+            "reachy-1",
+            "look",
+            pitch=10,
+            yaw=20,
+            roll=-30,
+        )
+
+    def test_center_resets_pose_and_antennas(self):
+        driver = self._make_driver()
+        asyncio.run(driver.look(pitch=15, yaw=-10))
+        asyncio.run(driver.antennas(left=20, right=-20))
+        driver.invoke_remote.reset_mock()
+
+        result = asyncio.run(driver.handleVoiceCommand("center"))
+        state = asyncio.run(driver.get_controller_state())
+
+        self.assertEqual(result["action"], "center")
+        self.assertEqual(driver.invoke_remote.await_count, 2)
+        self.assertEqual(state["pose"]["pitch"], 0)
+        self.assertEqual(state["pose"]["yaw"], 0)
+        self.assertEqual(state["antennas"]["left"], 0)
+        self.assertEqual(state["antennas"]["right"], 0)
+
+    def test_low_confidence_command_is_ignored(self):
+        driver = self._make_driver(min_confidence=0.8)
+        result = asyncio.run(driver.handleVoiceCommand("yaw left", confidence=0.5))
+        self.assertEqual(result["status"], "ignored")
+        self.assertEqual(result["reason"], "low_confidence")
+        driver.invoke_remote.assert_not_awaited()
+
+    def test_event_handler_filters_unexpected_source(self):
+        driver = self._make_driver(source_device_id="voice-1")
+        asyncio.run(
+            driver.onVoiceCommandCaptured(
+                "voice-2",
+                "voiceCommandCaptured",
+                {"transcript": "yaw left", "confidence": 0.95},
+            )
+        )
+        driver.invoke_remote.assert_not_awaited()
+
+    def test_event_handler_forwards_matching_source(self):
+        driver = self._make_driver(source_device_id="voice-1")
+        asyncio.run(
+            driver.onVoiceCommandCaptured(
+                "voice-1",
+                "voiceCommandCaptured",
+                {"transcript": "pitch down", "confidence": 0.95},
+            )
+        )
+        driver.invoke_remote.assert_awaited_once_with(
+            "reachy-1",
+            "look",
+            pitch=5,
+            yaw=0,
+            roll=0,
+        )
+
+    def test_unknown_command_is_ignored(self):
+        driver = self._make_driver()
+        result = asyncio.run(driver.handleVoiceCommand("dance party"))
+        self.assertEqual(result["status"], "ignored")
+        self.assertEqual(result["reason"], "unrecognized_command")
+        driver.invoke_remote.assert_not_awaited()
 
 
 # ── TestInitDeviceConnect ─────────────────────────────────────────

@@ -24,6 +24,8 @@ from typing import Optional
 from device_connect_sdk import DeviceRuntime
 
 from strands_robots.device_connect.reachy_mini_driver import ReachyMiniDriver
+from strands_robots.device_connect.reachy_voice_core import ReachyVoiceCommandCore
+from strands_robots.device_connect.reachy_voice_controller import ReachyVoiceController
 from strands_robots.device_connect.robot_driver import RobotDeviceDriver
 from strands_robots.device_connect.sim_driver import SimulationDeviceDriver
 
@@ -35,6 +37,8 @@ __all__ = [
     "RobotDeviceDriver",
     "SimulationDeviceDriver",
     "ReachyMiniDriver",
+    "ReachyVoiceCommandCore",
+    "ReachyVoiceController",
 ]
 
 
